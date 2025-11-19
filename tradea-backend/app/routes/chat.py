@@ -1,19 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
 from app.routes.depend import get_current_user
 from app.db.database import get_connection
-
-router = APIRouter()
-
-class ChatMessage(BaseModel):
-    trade_request_id: int
-    message: str
-
-# POST: Send a message
-from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from app.routes.depend import get_current_user
-from app.db.database import get_connection
 
 router = APIRouter()
 
@@ -27,11 +15,17 @@ def send_message(data: ChatMessage, current_user: int = Depends(get_current_user
     cur = conn.cursor()
 
     try:
-        # ✅ Verify trade request is accepted
+        # ✅ Validate message content
+        if not data.message.strip():
+            raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+        # ✅ Fetch trade request and allow "requested" or "accepted"
         cur.execute("SELECT buyer_id, post_id, status FROM trade_requests WHERE id = %s", (data.trade_request_id,))
         trade = cur.fetchone()
-        if not trade or trade[2] != "accepted":
-            raise HTTPException(status_code=403, detail="Trade request not accepted")
+        if not trade:
+            raise HTTPException(status_code=404, detail="Trade request not found")
+        if trade[2] not in ["requested", "accepted"]:
+            raise HTTPException(status_code=403, detail="Trade request not active")
 
         buyer_id, post_id, _ = trade
 
@@ -67,10 +61,12 @@ def send_message(data: ChatMessage, current_user: int = Depends(get_current_user
             }
         }
 
+    except HTTPException as e:
+        raise e  # ✅ Preserve original status codes
     except Exception as e:
         conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to send message: {str(e)}")
-
+        print("Send message error:", e)
+        raise HTTPException(status_code=500, detail="Unexpected error while sending message")
     finally:
         cur.close()
         conn.close()
@@ -84,7 +80,7 @@ def get_chat(trade_request_id: int, current_user: int = Depends(get_current_user
     # Verify trade is accepted and user is part of it
     cur.execute("SELECT buyer_id, post_id, status FROM trade_requests WHERE id = %s", (trade_request_id,))
     trade = cur.fetchone()
-    if not trade or trade[2] != "accepted":
+    if not trade or trade[2] not in ["requested", "accepted"]:
         raise HTTPException(status_code=403, detail="Chat not available")
 
     buyer_id, post_id, _ = trade

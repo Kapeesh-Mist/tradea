@@ -1,0 +1,27 @@
+.upload-page {
+  max-width: 600px;
+  margin: auto;
+  padding: 2rem;
+}
+
+.upload-form label {
+  display: block;
+  margin-bottom: 1rem;
+}
+
+.upload-form input[type="text"],
+.upload-form input[type="file"] {
+  width: 100%;
+  padding: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.preview-container {
+  margin: 1rem 0;
+}
+
+.preview-image {
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+}

@@ -24,7 +24,7 @@ def decrypt_payload(encrypted_str: str) -> dict:
     cipher = AES.new(key, AES.MODE_CFB, iv)
     decrypted = cipher.decrypt(encrypted)
     return json.loads(decrypted.decode())
-    
+
 @router.post("/trade/initiate")
 def initiate_trade(
     buyer_id: int = Form(...),
@@ -47,18 +47,39 @@ def initiate_trade(
 
         conn = get_connection()
         cur = conn.cursor()
+
+        # Insert trade
         cur.execute("""
             INSERT INTO trades (buyer_id, seller_id, item, price, encrypted_payload, buyer_demand, seller_demand)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (buyer_id, seller_id, item, price, encrypted, buyer_demand, seller_demand))
+
+        # Get trade_id
+        cur.execute("SELECT LASTVAL()")
+        trade_id = cur.fetchone()[0]
+
+        # Log activity
+        cur.execute("""
+            INSERT INTO trade_activity_log (trade_id, user_id, action, detail, timestamp)
+            VALUES (%s, %s, %s, %s, NOW())
+        """, (trade_id, buyer_id, "initiated_trade", f"Trade initiated by buyer {buyer_id}"))
+
+        # Optional: Create default milestones
+        milestones = ["Terms Proposed", "Terms Accepted", "Escrow Deposited", "Product Delivered", "Trade Completed"]
+        for title in milestones:
+            cur.execute("""
+                INSERT INTO trade_milestones (trade_id, title, type, status, timestamp)
+                VALUES (%s, %s, %s, %s, NOW())
+            """, (trade_id, title, title.lower().replace(" ", "_"), "pending"))
+
         conn.commit()
         cur.close()
         conn.close()
 
-        return {"message": "Trade initiated", "encrypted": encrypted}
+        return {"message": "Trade initiated", "trade_id": trade_id, "encrypted": encrypted}
     except Exception as e:
         return {"status": "error", "details": str(e)}
-
+    
 @router.post("/trade/confirm")
 def confirm_trade(trade_id: int = Form(...), user_id: int = Form(...)):
     conn = get_connection()
@@ -78,12 +99,20 @@ def confirm_trade(trade_id: int = Form(...), user_id: int = Form(...)):
     # Update confirmation
     if user_id == buyer_id and not buyer_confirmed:
         cur.execute("UPDATE trades SET buyer_confirmed = TRUE WHERE id = %s", (trade_id,))
+        action = "buyer_confirmed"
     elif user_id == seller_id and not seller_confirmed:
         cur.execute("UPDATE trades SET seller_confirmed = TRUE WHERE id = %s", (trade_id,))
+        action = "seller_confirmed"
     else:
         cur.close()
         conn.close()
         return {"status": "error", "details": "Invalid user or already confirmed"}
+
+    # Log activity
+    cur.execute("""
+        INSERT INTO trade_activity_log (trade_id, user_id, action, detail, timestamp)
+        VALUES (%s, %s, %s, %s, NOW())
+    """, (trade_id, user_id, action, f"User {user_id} confirmed trade"))
 
     conn.commit()
 
@@ -97,7 +126,7 @@ def confirm_trade(trade_id: int = Form(...), user_id: int = Form(...)):
         return {"message": "Trade fully confirmed"}
     else:
         return {"message": "Confirmation recorded, waiting for other party"}
-
+    
 @router.get("/trade/view")
 def view_trade(trade_id: int):
     conn = get_connection()

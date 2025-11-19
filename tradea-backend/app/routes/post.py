@@ -1,14 +1,14 @@
 from fastapi import APIRouter,Depends, Form, UploadFile, File, Query,HTTPException
 from fastapi.responses import JSONResponse
-import shutil
+import shutil,os,uuid
 from pydantic import BaseModel
 from app.db.database import get_connection
 from app.routes.depend import get_current_user
-import shutil
-post_router = APIRouter()
-
 import base64
 import json
+post_router = APIRouter()
+
+
 
 class TradeRequest(BaseModel):
     buyer_id: int
@@ -28,36 +28,45 @@ def upload_post(
     tags_raw: str = Form(...),
     file: UploadFile = File(None),
     link: str = Form(None),
-    user_id: int = Depends(get_current_user)  # ✅ Expect int directly
+    user_id: int = Depends(get_current_user)
 ):
     print("User ID:", user_id)
     print("Caption:", caption)
     print("File:", file.filename if file else "No file")
 
-    # Parse tags
+    # ✅ Parse tags
     tags = [tag.strip().lower() for tag in tags_raw.split(",") if tag.strip()]
+    tags_json = json.dumps(tags)
 
-    # Handle file or link
+    # ✅ Handle file or link
+    file_url = None
     if file and file.filename:
-        file_path = f"Files/{file.filename}"
+        allowed_types = ["image/jpeg", "image/png", "video/mp4"]
+        if file.content_type not in allowed_types:
+            raise HTTPException(status_code=400, detail="Unsupported file type")
+
+        os.makedirs("Files/posts", exist_ok=True)
+        safe_filename = f"{user_id}_{uuid.uuid4().hex}_{file.filename}"
+        file_path = os.path.join("Files", "posts", safe_filename)
+
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        file_url = file_path
+
+        file_url = f"/Files/posts/{safe_filename}"
     elif link:
         file_url = link
     else:
         return JSONResponse(content={"error": "No file or link provided"}, status_code=400)
 
-    # Insert into posts table
+    # ✅ Insert into DB
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO posts (user_id, caption, tags, file_url, likes_count)
         VALUES (%s, %s, %s, %s, %s)
         RETURNING id
-    """, (user_id, caption, tags, file_url, 0))
+    """, (user_id, caption, tags_json, file_url, 0))
     post_id = cur.fetchone()[0]
-
     conn.commit()
     cur.close()
     conn.close()
@@ -65,6 +74,7 @@ def upload_post(
     return JSONResponse(content={
         "message": "Post uploaded successfully",
         "post_id": post_id,
+        "caption": caption,
         "file_url": file_url,
         "tags": tags
     })
@@ -100,89 +110,61 @@ def get_post(post_id: int):
 
     return {"post": post}
 
-@post_router.get("/user/{user_id}/posts")
-def get_user_posts(user_id: int):
-    conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT id, caption, tags, file_url, created_at, status, likes_count
-        FROM posts
-        WHERE user_id = %s
-        ORDER BY created_at DESC
-    """, (user_id,))
-    rows = cur.fetchall()
-
-    cur.close()
-    conn.close()
-
-    posts = []
-    for row in rows:
-        posts.append({
-            "post_id": row[0],
-            "caption": row[1],
-            "tags": row[2] if row[2] else [],
-            "file_url": row[3],
-            "created_at": row[4],
-            "status": row[5],
-            "likes_count": row[6]
-        })
-
-    return {"user_id": user_id, "posts": posts}
-
 @post_router.get("/posts/discover")
 def discover_posts(
-    tag: str = Query(None),
-    min_trust: int = Query(None),
+    search: str = Query(""),  # Free text search
+    min_trust: int = Query(30),  # Default trust score
     sort_by: str = Query("created_at")  # Options: "created_at", "trust_score"
 ):
     conn = get_connection()
     cur = conn.cursor()
 
-    # Base query
+    # ✅ Fetch all active posts with user trust score
     query = """
         SELECT p.id, p.user_id, p.caption, p.tags, p.file_url, p.created_at, u.trust_score, p.likes_count
         FROM posts p
         JOIN users u ON p.user_id = u.id
-        WHERE p.status = 'active'
+        WHERE p.status = 'active' AND u.trust_score >= %s
     """
-    params = []
+    query += " ORDER BY u.trust_score DESC" if sort_by == "trust_score" else " ORDER BY p.created_at DESC"
 
-    # Filter by tag (match any tag in array)
-    if tag:
-        query += " AND %s = ANY(p.tags)"
-        params.append(tag.lower())
-
-    # Filter by trust score
-    if min_trust is not None:
-        query += " AND u.trust_score >= %s"
-        params.append(min_trust)
-
-    # Sorting
-    if sort_by == "trust_score":
-        query += " ORDER BY u.trust_score DESC"
-    else:
-        query += " ORDER BY p.created_at DESC"
-
-    cur.execute(query, tuple(params))
+    cur.execute(query, (min_trust,))
     rows = cur.fetchall()
     cur.close()
     conn.close()
 
+    search_lower = search.strip().lower()
     posts = []
+
     for row in rows:
+        post_id, user_id, caption, tags_raw, file_url, created_at, trust_score, likes_count = row
+
+        try:
+            tags = json.loads(tags_raw) if tags_raw else []
+            if not isinstance(tags, list):
+                tags = []
+        except:
+            tags = []
+
+        # ✅ Match if any tag contains the search term as substring
+        if search_lower and len(search_lower) >= 3:
+            match_found = any(search_lower in tag.lower() for tag in tags)
+            if not match_found:
+                continue  # Skip if no tag matches
+        # If no search term or it's too short, show all
+
         posts.append({
-            "post_id": row[0],
-            "user_id": row[1],
-            "caption": row[2],
-            "tags": row[3] if row[3] else [],
-            "file_url": row[4],
-            "created_at": row[5],
-            "trust_score": row[6],
-            "likes_count": row[7]
+            "post_id": post_id,
+            "user_id": user_id,
+            "caption": caption,
+            "tags": tags,
+            "file_url": file_url,
+            "created_at": created_at.isoformat(),
+            "trust_score": trust_score,
+            "likes_count": likes_count
         })
 
-    return {"posts": posts}
+    return JSONResponse(content={"posts": posts})
 
 @post_router.post("/post/{post_id}/initiate-trade")
 def initiate_trade_from_post(
@@ -250,26 +232,52 @@ def initiate_trade_from_post(
         "product_id": product_id
     }
 
-@post_router.post("/post/{product_id}/trade-request")
+@post_router.post("/post/{post_id}/trade-request")
 def create_trade_request(post_id: int, request: TradeRequest):
     conn = get_connection()
     cur = conn.cursor()
 
     try:
-        # Validate post exists and is active
-        cur.execute("SELECT id FROM posts WHERE id = %s AND status = 'active'", (post_id,))
-        if not cur.fetchone():
+        # Step 1: Validate post exists and is active
+        cur.execute("SELECT user_id FROM posts WHERE id = %s AND status = 'active'", (post_id,))
+        post = cur.fetchone()
+        if not post:
             raise HTTPException(status_code=404, detail="Post not found or inactive")
 
-        # Insert trade request using post_id
+        seller_id = post[0]
+
+        # Step 2: Insert trade request
         cur.execute("""
-            INSERT INTO trade_requests (post_id, buyer_id, message, status)
-            VALUES (%s, %s, %s, 'pending')
-        """, (post_id, request.buyer_id, request.message))
+            INSERT INTO trade_requests (post_id, buyer_id, owner_id, initial_message, status)
+            VALUES (%s, %s, %s, %s, 'requested')
+            RETURNING id
+        """, (post_id, request.buyer_id, seller_id, request.message))
+        request_id = cur.fetchone()[0]
+
+        # Step 3: Create chat thread
+        cur.execute("""
+            INSERT INTO chats (buyer_id, seller_id, post_id, request_id, status)
+            VALUES (%s, %s, %s, %s, 'requested')
+            RETURNING id
+        """, (request.buyer_id, seller_id, post_id, request_id))
+        chat_id = cur.fetchone()[0]
 
         conn.commit()
-        return {"message": "Trade request sent"}
+        cur.execute("SELECT username, avatar_url FROM users WHERE id = %s", (seller_id,))
+        user = cur.fetchone()
+        username, avatar_url = user
 
+        return {
+            "message": "Trade request created",
+            "chat": {
+                "chat_id": chat_id,
+                "request_id": request_id,
+                "status": "requested",
+                "username": username,
+                "avatar_url": avatar_url,
+                "initial_message": request.message
+            }
+        }
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to create trade request: {str(e)}")
@@ -277,6 +285,7 @@ def create_trade_request(post_id: int, request: TradeRequest):
     finally:
         cur.close()
         conn.close()
+
 
 @post_router.post("/trade-request/{request_id}/accept")
 def accept_trade_request(request_id: int, current_user: int = Depends(get_current_user)):
@@ -288,6 +297,12 @@ def accept_trade_request(request_id: int, current_user: int = Depends(get_curren
         SET status = 'accepted'
         WHERE id = %s
     """, (request_id,))
+    cur.execute("""
+        UPDATE chats
+        SET status = 'active'
+        WHERE request_id = %s
+    """, (request_id,))
+
 
     conn.commit()
     cur.close()
@@ -305,9 +320,38 @@ def decline_trade_request(request_id: int, current_user: int = Depends(get_curre
         SET status = 'declined'
         WHERE id = %s
     """, (request_id,))
-
+    cur.execute("""
+        UPDATE chats
+        SET status = 'closed'
+        WHERE request_id = %s
+    """, (request_id,))
     conn.commit()
     cur.close()
     conn.close()
 
     return {"message": "Trade request declined"}
+
+@post_router.get("/trade-request/{request_id}")
+def get_trade_request(request_id: int, current_user: int = Depends(get_current_user)):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT tr.id, tr.status, p.user_id AS owner_id
+        FROM trade_requests tr
+        JOIN posts p ON p.id = tr.post_id
+        WHERE tr.id = %s
+    """, (request_id,))
+    row = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Trade request not found")
+
+    return {
+        "request_id": row[0],
+        "status": row[1],
+        "owner_id": row[2]
+    }

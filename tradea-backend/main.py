@@ -6,6 +6,7 @@ from app.routes.auth import auth_router
 from app.routes.post import post_router
 from app.routes.product import product_router
 from app.routes import chat
+from app.routes import messages
 import os
 
 app = FastAPI(
@@ -23,7 +24,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ✅ Serve uploaded files from /Files
+# ✅ Serve uploaded avatars from /static
+app.mount(
+    "/static",
+    StaticFiles(directory="static"),
+    name="static"
+)
+
+# ✅ Serve other uploaded files from /Files
 app.mount(
     "/Files",
     StaticFiles(directory=os.path.join(os.path.dirname(__file__), "Files")),
@@ -38,6 +46,7 @@ app.include_router(auth_router, tags=["Auth"])
 app.include_router(post_router, tags=["Post"])
 app.include_router(product_router, tags=["Product"])
 app.include_router(chat.router, tags=["Chat"])
+app.include_router(messages.router, tags=["messages"])
 
 # ✅ Root route
 @app.get("/", tags=["Root"])
