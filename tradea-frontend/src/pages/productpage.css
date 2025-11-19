@@ -1,0 +1,133 @@
+.products-page {
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 2rem;
+  font-family: 'Poppins', sans-serif;
+}
+
+.search-bar {
+  text-align: center;
+  margin-bottom: 2rem;
+}
+
+.search-bar input {
+  width: 60%;
+  padding: 0.75rem 1rem;
+  font-size: 1rem;
+  border: 1px solid #ccc;
+  border-radius: 30px;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+}
+
+.product-feed {
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
+}
+
+.product-row {
+  display: flex;
+  gap: 2rem;
+  align-items: flex-start;
+}
+
+.product-card {
+  flex: 1;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+  padding: 1.5rem;
+  position: relative;
+}
+
+.product-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+}
+
+.owner-link {
+  color: #0056D2;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.three-dots {
+  font-size: 1.5rem;
+  cursor: pointer;
+  color: #555;
+  padding: 0 0.5rem;
+  transition: color 0.2s ease;
+}
+
+.three-dots:hover {
+  color: #000;
+}
+
+.product-media img,
+.product-media video {
+  width: 100%;
+  border-radius: 10px;
+  object-fit: cover;
+  margin-bottom: 1rem;
+}
+
+.product-title {
+  font-size: 1.2rem;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+}
+
+.product-actions {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+
+.product-actions button {
+  background: none;
+  border: none;
+  font-size: 1rem;
+  cursor: pointer;
+  color: #0056D2;
+  transition: color 0.2s ease;
+}
+
+.product-actions button:hover {
+  color: #003e9c;
+}
+
+.product-meta {
+  font-size: 0.9rem;
+  color: #555;
+}
+
+.product-details {
+  min-width: 250px;
+  background: #f9f9f9;
+  border-radius: 12px;
+  padding: 1rem;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.product-details h4 {
+  margin-bottom: 1rem;
+  font-size: 1.1rem;
+  color: #333;
+}
+
+.no-products {
+  text-align: center;
+  font-size: 1rem;
+  color: #777;
+}
+
+.loading {
+  text-align: center;
+  font-size: 1rem;
+  color: #555;
+}
