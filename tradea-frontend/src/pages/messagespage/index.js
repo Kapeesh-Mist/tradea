@@ -65,15 +65,22 @@ function MessagesPage() {
   }, [location.state, token]);
 
   return (
-    <div className="messages-page">
-      <InboxSidebar
-        chatRequests={chatRequests}
-        ongoingTrades={ongoingTrades}
-        pastTrades={pastTrades}
-        selectedChat={selectedChat}
-        setSelectedChat={setSelectedChat}
-      />
-      <ChatWindow chat={selectedChat} chatStatus={chatStatus} />
+    <div className="messages-page flex h-full font-sans overflow-hidden">
+      {/* Sidebar with independent scroll */}
+      <div className="w-80 flex-shrink-0 border-r border-gray-200 bg-white overflow-y-auto">
+        <InboxSidebar
+          chatRequests={chatRequests}
+          ongoingTrades={ongoingTrades}
+          pastTrades={pastTrades}
+          selectedChat={selectedChat}
+          setSelectedChat={setSelectedChat}
+        />
+      </div>
+
+      {/* Chat window with fixed header and scrollable messages */}
+      <div className="flex-1 flex flex-col min-w-0 bg-white">
+        <ChatWindow chat={selectedChat} chatStatus={chatStatus} isSidebarMode={false} />
+      </div>
     </div>
   );
 }

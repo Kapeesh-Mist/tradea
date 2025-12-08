@@ -19,7 +19,8 @@
   border-right: 1px solid #ddd;
   padding: 1rem;
   position: fixed;
-  top: 60px; /* height of Topbar */
+  top: 60px;
+  /* height of Topbar */
   bottom: 0;
   left: 0;
   z-index: 10;
@@ -41,11 +42,13 @@
 }
 
 .layout-scroll-area {
-  margin-left: 220px; /* width of sidebar */
-  margin-top: 60px;   /* height of topbar */
+  margin-left: 220px;
+  /* width of sidebar */
+  margin-top: 60px;
+  /* height of topbar */
   flex: 1;
   overflow-y: auto;
-  padding: 2rem;
-  background: #fff;
+  padding: 0;
+  background: #0f172a;
   height: calc(100vh - 60px);
 }
