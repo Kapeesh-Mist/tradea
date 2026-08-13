@@ -75,8 +75,6 @@ async def login(payload: LoginRequest):
         raise HTTPException(status_code=401, detail="Incorrect password")
 
     token = create_access_token(user_id)
-    print("🔑 Issued token:", token)
-    print("🔑 Type of token:", type(token))
 
     return {
         "status": "success",

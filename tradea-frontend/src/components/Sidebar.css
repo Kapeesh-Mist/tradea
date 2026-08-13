@@ -1,8 +1,4 @@
-@media (max-height: 700px) {
-  .sidebar {
-    height: 85vh;
-  }
-}
+
 .sidebar {
   width: 200px;
   background-color: #f8f9fa;

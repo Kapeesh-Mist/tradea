@@ -1,16 +1,18 @@
 import os
-import openai
 import json
 from dotenv import load_dotenv
+from openai import OpenAI
+from openai.types.chat import ChatCompletionMessageParam
 
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 __all__ = [
     "extract_demand_from_chat",
     "generate_trade_terms",
     "extract_structured_terms"
 ]
+
 # Function schema for structured trade term extraction
 extract_trade_terms_schema = [
     {
@@ -35,22 +37,14 @@ def extract_demand_from_chat(chat: str, role: str) -> str:
     """
     Extracts the core demand or offer from a chat message using OpenAI.
     """
-    prompt = f"""
-You are analyzing chat messages from a {role}.
-Extract their core demand or offer in one sentence.
-
-Chat:
-{chat}
-
-Output: [Summarize clearly]
-"""
     try:
-        response = openai.ChatCompletion.create(
+        messages: list[ChatCompletionMessageParam] = [
+            {"role": "system", "content": "You are a helpful assistant that extracts concise demands from chat."},
+            {"role": "user", "content": f"You are analyzing chat messages from a {role}. Extract their core demand or offer in one sentence.\n\nChat:\n{chat}\n\nOutput: [Summarize clearly]"}
+        ]
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that extracts concise demands from chat."},
-                {"role": "user", "content": prompt}
-            ]
+            messages=messages
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -61,7 +55,8 @@ def generate_trade_terms(buyer_demand: str, seller_demand: str, item: str, initi
     """
     Generates a detailed, legally clear trade agreement using OpenAI GPT-3.5.
     """
-    prompt = f"""
+    try:
+        prompt = f"""
 You are a legal assistant for a freelance trade platform called Tradea.
 
 Your task is to generate a clear, structured, and legally sound "Trade Agreement" based on the following trade details between a Buyer and a Seller.
@@ -80,48 +75,15 @@ Trade Details:
 - Trade Initiated By: {initiator}
 
 Output Format (Markdown):
-
-### Trade Agreement
-
-**1. Parties Involved:**
-- **Buyer:** [Name or ID if known]
-- **Seller:** [Name or ID if known]
-- **Trade Initiated By:** {initiator}
-
-**2. Item/Service Description:**
-{item}
-
-**3. Deliverables:**
-[Clearly list what the seller agrees to deliver based on seller offer]
-
-**4. Timeline:**
-[Specify delivery deadlines if mentioned, otherwise write "As agreed between parties"]
-
-**5. Payment Terms:**
-[Specify amount, currency, and payment method or escrow terms]
-
-**6. Revisions:**
-[State number of revisions allowed, or "To be discussed"]
-
-**7. Ownership & Rights:**
-[Clarify who owns the final product, usage rights, and copyright]
-
-**8. Original Demands (for transparency):**
-- **Buyer Demand:** {buyer_demand}
-- **Seller Offer:** {seller_demand}
-
-**9. Legal Disclaimer:**
-Tradea is a neutral platform that facilitates communication and escrow between users. Tradea is not a party to this agreement and assumes no responsibility for the content, quality, legality, or delivery of the services or items exchanged. All disputes must be resolved directly between the Buyer and Seller. By proceeding with this trade, both parties acknowledge and accept these terms.
-
-If any section is unclear or missing in the trade details, use "To be discussed" or reasonable assumptions based on standard freelance practices.
-"""
-    try:
-        response = openai.ChatCompletion.create(
+[Follow the structure with 9 sections as described]
+        """
+        messages: list[ChatCompletionMessageParam] = [
+            {"role": "system", "content": "You are a legal assistant that drafts trade agreements."},
+            {"role": "user", "content": prompt}
+        ]
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a legal assistant that drafts trade agreements."},
-                {"role": "user", "content": prompt}
-            ]
+            messages=messages
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -133,16 +95,17 @@ def extract_structured_terms(chat: str) -> dict:
     Uses OpenAI function calling to extract structured trade terms from chat.
     """
     try:
-        response = openai.ChatCompletion.create(
+        messages: list[ChatCompletionMessageParam] = [
+            {"role": "system", "content": "You are a trade assistant that extracts structured trade terms from chat."},
+            {"role": "user", "content": chat}
+        ]
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
-            messages=[
-                {"role": "system", "content": "You are a trade assistant that extracts structured trade terms from chat."},
-                {"role": "user", "content": chat}
-            ],
+            messages=messages,
             functions=extract_trade_terms_schema,
             function_call={"name": "extract_trade_terms"}
         )
-        args = response["choices"][0]["message"]["function_call"]["arguments"]
+        args = response.choices[0].message.function_call.arguments
         return json.loads(args)
     except Exception as e:
         print(f"OpenAI Structured Extraction Error: {e}")

@@ -1,4 +1,7 @@
-from fastapi import APIRouter, Form, UploadFile, File, HTTPException,Depends
+from fastapi import APIRouter, Form, UploadFile, File, HTTPException,Depends,Request
+from fastapi.responses import JSONResponse,FileResponse
+from typing import List
+import mimetypes
 import shutil
 from pathlib import Path
 from app.db.database import get_connection
@@ -7,9 +10,12 @@ from Crypto.Random import get_random_bytes
 import base64
 import json
 import os
+from datetime import datetime,timedelta
 from app.routes.depend import get_current_user
 from app.utils.openai import generate_trade_terms,extract_demand_from_chat
-
+from app.utils.gemini import extract_demand_from_chat_gemini, generate_trade_terms_gemini
+from app.utils.deepseek import extract_demand_from_chat_deepseek, generate_trade_terms_deepseek
+from urllib.parse import unquote
 router = APIRouter()
 
 def encrypt_payload(data: dict) -> str:
@@ -27,6 +33,20 @@ def decrypt_payload(encrypted_str: str) -> dict:
     cipher = AES.new(key, AES.MODE_CFB, iv)
     decrypted = cipher.decrypt(encrypted)
     return json.loads(decrypted.decode())
+
+
+@router.get("/static/files/{filename}")
+def serve_file(filename: str):
+    
+    filename = unquote(filename)
+    path = os.path.join("Files", filename)  # 👈 this matches your actual folder
+    print("Serving file from:", path)
+    if not os.path.exists(path):
+        return {"error": "File not found"}
+    mime_type, _ = mimetypes.guess_type(path)
+    
+    return FileResponse(path, media_type=mime_type or "application/octet-stream")
+
 
 @router.post("/trade-intent")
 def record_trade_intent(
@@ -93,17 +113,14 @@ def get_trade_intent(request_id: int):
 @router.post("/trade/initiate")
 def initiate_trade(
     request_id: int = Form(...),
-    buyer_demand: str = Form(None),
-    seller_demand: str = Form(None),
     user: int = Depends(get_current_user)
 ):
     print(f"🔁 Initiating trade for request_id={request_id}")
-
     try:
         conn = get_connection()
         cur = conn.cursor()
 
-        # ✅ Fetch buyer/seller/item/price from trade_requests
+        # 1. Fetch buyer/seller/item from trade_requests
         cur.execute("""
             SELECT buyer_id, owner_id, post_id
             FROM trade_requests
@@ -111,37 +128,57 @@ def initiate_trade(
         """, (request_id,))
         request_row = cur.fetchone()
         if not request_row:
-            print("❌ Invalid request_id")
             return {"status": "error", "details": "Invalid request_id"}
 
         buyer_id, seller_id, post_id = request_row
         cur.execute("SELECT caption FROM posts WHERE id = %s", (post_id,))
         post_row = cur.fetchone()
         if not post_row:
-            print("❌ Post not found for given post_id")
             return {"status": "error", "details": "Post not found for this request"}
 
-        item = post_row[0] 
-        price = 0  # You can fetch price from another table if needed
+        item = post_row[0]
+        price = 0  # Default price
 
-        print(f"✅ Resolved buyer={buyer_id}, seller={seller_id}, item={item}")
-
-        # ✅ Check mutual intent
+        # 2. Check mutual intent
         cur.execute("SELECT buyer_started, seller_started FROM trade_intents WHERE request_id = %s", (request_id,))
         intent = cur.fetchone()
         if not intent or not (intent[0] and intent[1]):
-            print("❌ Mutual intent not confirmed")
             return {"status": "error", "details": "Both parties must confirm intent before initiating trade"}
-        print("✅ Mutual intent confirmed")
 
-        # ✅ Check for existing trade
+        # 3. Check for existing trade
         cur.execute("SELECT id FROM trades WHERE request_id = %s", (request_id,))
         existing = cur.fetchone()
         if existing:
-            print(f"⚠️ Trade already exists: trade_id={existing[0]}")
             return {"status": "ok", "trade_id": existing[0], "message": "Trade already exists"}
 
-        # ✅ Encrypt payload
+        # 4. Fetch chat messages
+        cur.execute("""
+            SELECT sender_id, message
+            FROM chat
+            WHERE trade_request_id = %s
+            ORDER BY timestamp ASC
+        """, (request_id,))
+        messages = cur.fetchall()
+
+        buyer_msgs = [msg for uid, msg in messages if uid == buyer_id]
+        seller_msgs = [msg for uid, msg in messages if uid == seller_id]
+        buyer_context = "\n".join([f"Buyer: {msg}" for msg in buyer_msgs])
+        seller_context = "\n".join([f"Seller: {msg}" for msg in seller_msgs])
+
+        # 5. Extract demands with fallback
+        def extract_with_fallback(context, role):
+            try:
+                return extract_demand_from_chat_gemini(context, role=role)
+            except:
+                try:
+                    return extract_demand_from_chat(context, role=role)
+                except:
+                    return extract_demand_from_chat_deepseek(context, role=role)
+
+        buyer_demand = extract_with_fallback(buyer_context, "buyer")
+        seller_demand = extract_with_fallback(seller_context, "seller")
+
+        # 6. Encrypt payload
         payload = {
             "buyer_id": buyer_id,
             "seller_id": seller_id,
@@ -151,35 +188,31 @@ def initiate_trade(
             "seller_demand": seller_demand
         }
         encrypted = encrypt_payload(payload)
-        print("🔐 Payload encrypted")
 
-        # ✅ Insert trade
+        # 7. Insert trade
         cur.execute("""
             INSERT INTO trades (buyer_id, seller_id, item, price, encrypted_payload, request_id)
             VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING id
         """, (buyer_id, seller_id, item, price, encrypted, request_id))
         trade_id = cur.fetchone()[0]
-        print(f"✅ Trade inserted: trade_id={trade_id}")
 
-        # ✅ Insert trade terms
+        # 8. Insert trade_terms version 1
         cur.execute("""
             INSERT INTO trade_terms (
                 trade_id, version, buyer_demand, seller_demand, terms_text,
-                buyer_accepted, seller_accepted, finalized, edited_by
+                buyer_accepted, seller_accepted, finalized
             )
-            VALUES (%s, 1, %s, %s, '', FALSE, FALSE, FALSE, %s)
-        """, (trade_id, buyer_demand, seller_demand, user))
-        print("📄 Trade terms inserted")
+            VALUES (%s, 1, %s, %s, '', FALSE, FALSE, FALSE)
+        """, (trade_id, buyer_demand, seller_demand))
 
-        # ✅ Log activity
+        # 9. Log activity
         cur.execute("""
             INSERT INTO trade_activity_log (trade_id, user_id, action, detail, timestamp)
             VALUES (%s, %s, %s, %s, NOW())
         """, (trade_id, user, "initiated_trade", f"Trade initiated by user {user}"))
-        print("📝 Activity log recorded")
 
-        # ✅ Insert default milestones
+        # 10. Insert default milestones
         milestones = [
             ("Terms Proposed", "Agreement on trade terms"),
             ("Terms Accepted", "Both parties accept terms"),
@@ -192,19 +225,236 @@ def initiate_trade(
                 INSERT INTO trade_milestones (trade_id, title, description, delivered, confirmed)
                 VALUES (%s, %s, %s, FALSE, FALSE)
             """, (trade_id, title, desc))
-        print("📌 Default milestones inserted")
 
         conn.commit()
-        cur.close()
-        conn.close()
-        print("🎉 Trade committed successfully")
-
         return {"message": "Trade initiated", "trade_id": trade_id, "encrypted": encrypted}
 
     except Exception as e:
-        print("❌ Trade initiation failed:", str(e))
-        traceback.print_exc()
+        conn.rollback()
         return {"status": "error", "details": str(e)}
+
+    finally:
+        cur.close()
+        conn.close()
+
+@router.put("/trade/details/update")
+def update_trade_details(
+    trade_id: int = Form(...),
+    item: str = Form(...),
+    price: float = Form(...),
+    deadline: str = Form(...),  # ISO string
+    demand: str = Form(...),  # This will be buyer OR seller demand
+    user: int = Depends(get_current_user)
+):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+
+        # 1. Get buyer and seller IDs
+        cur.execute("SELECT buyer_id, seller_id FROM trades WHERE id = %s", (trade_id,))
+        row = cur.fetchone()
+        if not row:
+            return {"status": "error", "details": "Trade not found"}
+        buyer_id, seller_id = row
+
+        # 2. Determine role
+        if user == buyer_id:
+            demand_column = "buyer_demand"
+        elif user == seller_id:
+            demand_column = "seller_demand"
+        else:
+            return {"status": "error", "details": "You are not a participant in this trade"}
+
+        # 3. Update trades table
+        cur.execute("""
+            UPDATE trades
+            SET item = %s, price = %s, deadline = %s
+            WHERE id = %s
+        """, (item, price, deadline, trade_id))
+
+        # 4. Update user's own demand in latest trade_terms version
+        cur.execute(f"""
+            UPDATE trade_terms
+            SET {demand_column} = %s
+            WHERE trade_id = %s
+              AND version = (
+                  SELECT MAX(version)
+                  FROM trade_terms
+                  WHERE trade_id = %s
+              )
+        """, (demand, trade_id, trade_id))
+
+        conn.commit()
+        return {"message": f"{demand_column.replace('_', ' ').capitalize()} updated successfully"}
+
+    except Exception as e:
+        conn.rollback()
+        print("❌ Update failed:", str(e))
+        return {"status": "error", "details": str(e)}
+
+    finally:
+        cur.close()
+        conn.close()
+
+@router.get("/trade/details/fetch")
+def fetch_trade_details(trade_id: int, user: int = Depends(get_current_user)):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+
+        print(f"🔍 Fetching trade_id={trade_id} for user={user} ({type(user)})")
+
+        # 1. Get trade basics
+        cur.execute("""
+            SELECT item, price, deadline, created_at, buyer_id, seller_id
+            FROM trades
+            WHERE id = %s
+        """, (trade_id,))
+        trade = cur.fetchone()
+        if not trade:
+            return {"status": "error", "details": "Trade not found"}
+
+        item, price, deadline,created_at, buyer_id, seller_id = trade
+        print(f"📦 Trade row: buyer_id={buyer_id}, seller_id={seller_id}")
+
+        # 2. Get latest trade_terms
+        cur.execute("""
+            SELECT version, buyer_demand, seller_demand
+            FROM trade_terms
+            WHERE trade_id = %s
+            ORDER BY version DESC
+            LIMIT 1
+        """, (trade_id,))
+        terms = cur.fetchone()
+        if not terms:
+            return {"status": "error", "details": "No trade terms found"}
+
+        version, buyer_demand, seller_demand = terms
+
+        # 3. Ensure user is int
+        user = int(user)
+
+        # 4. Determine role
+        if user == buyer_id:
+            role = "buyer"
+            demand = buyer_demand
+            other_demand = seller_demand
+            other_user_id = seller_id
+        elif user == seller_id:
+            role = "seller"
+            demand = seller_demand
+            other_demand = buyer_demand
+            other_user_id = buyer_id
+        else:
+            print(f"❌ User {user} is not authorized for trade {trade_id}")
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "details": "You are not a participant in this trade"}
+            )
+
+        # 5. Get other user's name
+        cur.execute("SELECT username FROM users WHERE id = %s", (other_user_id,))
+        other_user_name = cur.fetchone()[0] if cur.rowcount else "Unknown"
+
+        print(f"✅ Role: {role}, Other user: {other_user_name}")
+
+        return {
+            "status": "ok",
+            "trade_id": trade_id,
+            "item": item,
+            "price": price,
+            "deadline": deadline.isoformat() if deadline else None,
+            "role": role,
+            "demand": demand,
+            "other_demand": other_demand,
+            "other_user_name": other_user_name,
+            "created_at": created_at.isoformat() if created_at else None
+        }
+
+    except Exception as e:
+        print(f"🔥 Exception: {e}")
+        return {"status": "error", "details": str(e)}
+
+    finally:
+        cur.close()
+        conn.close()
+
+@router.put("/trade/intent/proceed")
+async def proceed_trade_intent(request: Request):
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    try:
+        data = await request.json()
+        request_id = data.get("request_id")
+        role = data.get("role")
+        print("Incoming request_id:", request_id)
+        print("Incoming role:", role)
+        if not request_id or not role:
+            raise HTTPException(status_code=400, detail="Missing request_id or role")
+
+        if role not in ["buyer", "seller"]:
+            raise HTTPException(status_code=400, detail="Invalid role")
+
+        column = f"{role}_proceeded"
+
+        cur.execute(f"""
+            UPDATE trade_intents
+            SET {column} = TRUE
+            WHERE request_id = %s
+        """, (request_id,))
+        conn.commit()
+
+        cur.execute("""
+            SELECT buyer_proceeded, seller_proceeded
+            FROM trade_intents
+            WHERE request_id = %s
+        """, (request_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Trade intent not found")
+
+        return {
+            "status": "ok",
+            "buyer_proceeded": row[0],
+            "seller_proceeded": row[1]
+        }
+
+    except Exception as e:
+        print("🔥 Proceed intent error:", e)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    finally:
+        cur.close()
+        conn.close()
+
+@router.get("/trade/intent/status")
+def check_proceed_status(request_id: str):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT buyer_proceeded, seller_proceeded
+            FROM trade_intents
+            WHERE request_id = %s
+        """, (request_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Trade intent not found")
+
+        return {
+            "buyer_proceeded": row[0],
+            "seller_proceeded": row[1]
+        }
+
+    except Exception as e:
+        print("🔥 Status check error:", e)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    finally:
+        cur.close()
+        conn.close()
 
 @router.post("/trade/confirm")
 def confirm_trade(trade_id: int = Form(...), user_id: int = Form(...)):
@@ -294,99 +544,153 @@ def view_trade(trade_id: int, user: int = Depends(get_current_user)):
             "buyer_id": buyer_id,
             "seller_id": seller_id,
             "other_party_name": other_party_name,
-            "other_party_avatar_url": other_party_avatar_url
+            "other_party_avatar_url": other_party_avatar_url,
+            "role": "buyer" if user == buyer_id else "seller"
         }
     }
 
 @router.post("/trade/terms/generate")
-def generate_terms(trade_id: int = Form(...)):
+async def generate_terms(request: Request):
+    data = await request.json()
+    trade_id = data.get("request_id")
+
+    if not trade_id:
+        raise HTTPException(status_code=400, detail="Missing trade_id")
     conn = get_connection()
     cur = conn.cursor()
 
-    # 1. Get trade details including request_id
-    cur.execute("""
-        SELECT buyer_id, seller_id, item, request_id
-        FROM trades WHERE id = %s
-    """, (trade_id,))
-    result = cur.fetchone()
+    try:
+        # 1. Get trade details + usernames
+        cur.execute("""
+            SELECT t.buyer_id, t.seller_id, t.item, b.username, s.username
+            FROM trades t
+            JOIN users b ON t.buyer_id = b.id
+            JOIN users s ON t.seller_id = s.id
+            WHERE t.id = %s
+        """, (trade_id,))
+        result = cur.fetchone()
+        if not result:
+            return {"status": "error", "details": "Trade not found"}
 
-    if not result:
+        buyer_id, seller_id, item, buyer_name, seller_name = result
+
+        # 2. Get latest demands
+        cur.execute("""
+            SELECT version, buyer_demand, seller_demand
+            FROM trade_terms
+            WHERE trade_id = %s
+            ORDER BY version DESC
+            LIMIT 1
+        """, (trade_id,))
+        row = cur.fetchone()
+        if not row:
+            return {"status": "error", "details": "No trade terms found"}
+
+        version, buyer_demand, seller_demand = row
+        new_version = version + 1
+
+        # 3. Generate terms with fallback
+        def generate_terms_with_fallback():
+            try:
+                return generate_trade_terms_gemini(buyer_demand, seller_demand, item, "Buyer"), "gemini"
+            except:
+                try:
+                    return generate_trade_terms(buyer_demand, seller_demand, item, "Buyer"), "openai"
+                except:
+                    return generate_trade_terms_deepseek(buyer_demand, seller_demand, item, "Buyer"), "deepseek"
+
+        terms, terms_provider = generate_terms_with_fallback()
+
+        # 4. Replace placeholders and currency
+        terms = terms.replace("[Buyer Name/Tradea ID]", buyer_name)
+        terms = terms.replace("[Seller Name/Tradea ID]", seller_name)
+        terms = terms.replace("$", "₹")
+
+        # 5. Insert new trade_terms version
+        cur.execute("""
+            INSERT INTO trade_terms (
+                trade_id, version, buyer_demand, seller_demand, terms_text,
+                buyer_accepted, seller_accepted, finalized, edited_at
+            )
+            VALUES (%s, %s, %s, %s, %s, FALSE, FALSE, FALSE, %s)
+        """, (
+            trade_id, new_version,
+            buyer_demand, seller_demand,
+            terms, datetime.utcnow()
+        ))
+
+        # 6. Update milestone
+        cur.execute("""
+            UPDATE trade_milestones
+            SET delivered = TRUE, confirmed = TRUE
+            WHERE trade_id = %s AND title = 'Terms Proposed'
+        """, (trade_id,))
+
+        conn.commit()
+        return {
+            "message": "Terms generated",
+            "version": new_version,
+            "buyer_demand": buyer_demand,
+            "seller_demand": seller_demand,
+            "terms": terms,
+            "providers": {
+                "terms": terms_provider
+            }
+        }
+
+    except Exception as e:
+        conn.rollback()
+        return {"status": "error", "details": str(e)}
+
+    finally:
         cur.close()
         conn.close()
-        return {"status": "error", "details": "Trade not found"}
 
-    buyer_id, seller_id, item, request_id = result
+@router.get("/trade/terms/view")
+def view_latest_terms(trade_id: int, user: int = Depends(get_current_user)):
+    conn = get_connection()
+    cur = conn.cursor()
 
-    # 2. Fetch chat messages for this request
+    # Fetch latest version of terms for this trade
     cur.execute("""
-        SELECT sender_id, message
-        FROM chat
-        WHERE trade_request_id = %s
-        ORDER BY timestamp ASC
-    """, (request_id,))
-    messages = cur.fetchall()
+        SELECT version, terms_text, buyer_demand, seller_demand,
+               buyer_accepted, seller_accepted, edited_by, edited_at
+        FROM trade_terms
+        WHERE trade_id = %s
+        ORDER BY version DESC
+        LIMIT 1
+    """, (trade_id,))
+    row = cur.fetchone()
 
-    if not messages:
+    if not row:
         cur.close()
         conn.close()
-        return {"status": "error", "details": "No chat messages found"}
+        return {"status": "error", "details": "No terms found for this trade"}
 
-    # 3. Separate buyer and seller messages
-    buyer_msgs = [msg for uid, msg in messages if uid == buyer_id]
-    seller_msgs = [msg for uid, msg in messages if uid == seller_id]
+    version, terms_text, buyer_demand, seller_demand, buyer_accepted, seller_accepted, edited_by, edited_at = row
 
-    # 4. Use OpenAI to extract demands
-    buyer_context = "\n".join(buyer_msgs)
-    seller_context = "\n".join(seller_msgs)
+    # Determine role
+    cur.execute("SELECT buyer_id, seller_id FROM trades WHERE id = %s", (trade_id,))
+    trade_row = cur.fetchone()
+    buyer_id, seller_id = trade_row
+    role = "buyer" if user == buyer_id else "seller"
 
-    buyer_demand = extract_demand_from_chat(buyer_context, role="buyer")
-    seller_demand = extract_demand_from_chat(seller_context, role="seller")
-
-    # 5. Update trade_terms table with demands
-    cur.execute("""
-        UPDATE trade_terms
-        SET buyer_demand = %s, seller_demand = %s
-        WHERE id = %s
-    """, (buyer_demand, seller_demand, trade_id))
-
-    # 6. Generate terms using OpenAI
-    terms = generate_trade_terms(
-        buyer_demand=buyer_demand,
-        seller_demand=seller_demand,
-        item=item,
-        initiator="Buyer"  # or "Seller"
-    )
-
-    # 7. Insert new version into trade_terms
-    cur.execute("SELECT MAX(version) FROM trade_terms WHERE trade_id = %s", (trade_id,))
-    max_version = cur.fetchone()[0]
-    new_version = (max_version or 0) + 1
-
-    cur.execute("""
-        INSERT INTO trade_terms (
-            trade_id, version, terms_text,
-            buyer_accepted, seller_accepted, finalized
-        )
-        VALUES (%s, %s, %s, FALSE, FALSE, FALSE)
-    """, (trade_id, new_version, terms))
-
-    # 8. Update milestone
-    cur.execute("""
-        UPDATE trade_milestones
-        SET delivered = TRUE, confirmed = TRUE
-        WHERE trade_id = %s AND title = 'Terms Proposed'
-    """, (trade_id,))
-
-    conn.commit()
     cur.close()
     conn.close()
 
     return {
-        "message": "Terms generated",
-        "buyer_demand": buyer_demand,
-        "seller_demand": seller_demand,
-        "terms": terms,
-        "version": new_version
+        "status": "ok",
+        "version": version,
+        "terms_text": terms_text,
+        "user_demand": buyer_demand if role == "buyer" else seller_demand,
+        "other_demand": seller_demand if role == "buyer" else buyer_demand,
+        "accepted": {
+            "buyer": buyer_accepted,
+            "seller": seller_accepted
+        },
+        "edited_by": edited_by,
+        "edited_at": edited_at,
+        "role": role
     }
 
 @router.post("/trade/terms/edit")
@@ -502,6 +806,7 @@ def accept_terms(trade_id: int = Form(...), user_id: int = Form(...)):
         conn.close()
         return {"message": "Both users accepted terms. Trade is ready for escrow."}
         return {"message": "Terms accepted. Waiting for other party."}
+
 
 @router.post("/trade/escrow")
 def lock_escrow(trade_id: int = Form(...)):
@@ -881,12 +1186,14 @@ def get_user_trades(user_id: int):
     conn = get_connection()
     cur = conn.cursor()
 
+    # Fetch all trades where the user is buyer or seller
     cur.execute("""
         SELECT t.id, t.item, t.price,
                t.buyer_id, t.seller_id,
                COALESCE(td.buyer_confirmed, FALSE) as buyer_confirmed_delivery,
                COALESCE(td.seller_delivered, FALSE) as seller_delivered,
-               COALESCE(tc.completed, FALSE) as trade_completed
+               COALESCE(tc.completed, FALSE) as trade_completed,
+               COALESCE(t.is_cancelled, FALSE) as is_cancelled
         FROM trades t
         LEFT JOIN trade_delivery td ON t.id = td.trade_id
         LEFT JOIN trade_completion tc ON t.id = tc.trade_id
@@ -898,7 +1205,12 @@ def get_user_trades(user_id: int):
     trades = []
 
     for row in rows:
-        trade_id, item, price, buyer_id, seller_id, buyer_confirmed, seller_delivered, trade_completed = row
+        (
+            trade_id, item, price,
+            buyer_id, seller_id,
+            buyer_confirmed, seller_delivered,
+            trade_completed, is_cancelled
+        ) = row
 
         # Determine the other party
         other_id = seller_id if user_id == buyer_id else buyer_id
@@ -918,6 +1230,7 @@ def get_user_trades(user_id: int):
             "buyer_confirmed_delivery": buyer_confirmed,
             "seller_delivered": seller_delivered,
             "trade_completed": trade_completed,
+            "is_cancelled": is_cancelled,
             "other_party_name": other_name,
             "other_party_avatar_url": other_avatar
         })
@@ -927,91 +1240,103 @@ def get_user_trades(user_id: int):
     return {"trades": trades}
 
 @router.post("/trade/upload")
-def upload_trade_file(
+def upload_trade_files(
     trade_id: int = Form(...),
     uploader_id: int = Form(...),
-    file: UploadFile = File(...)
+    files: List[UploadFile] = File([]),
+    links: List[str] = Form([])
 ):
     conn = get_connection()
     cur = conn.cursor()
 
-    # Verify user is part of trade
+    # Validate trade and user
     cur.execute("SELECT buyer_id, seller_id FROM trades WHERE id = %s", (trade_id,))
     trade = cur.fetchone()
-    if not trade:
+    if not trade or uploader_id not in trade:
         cur.close()
         conn.close()
-        raise HTTPException(status_code=404, detail="Trade not found")
-    
-    if uploader_id not in trade:
-        cur.close()
-        conn.close()
-        raise HTTPException(status_code=403, detail="User not part of this trade")
+        raise HTTPException(status_code=403, detail="Invalid trade or user")
 
-    # Save file
     upload_dir = Path("Files")
     upload_dir.mkdir(exist_ok=True)
-    
-    file_path = upload_dir / f"trade_{trade_id}_{file.filename}"
-    with file_path.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    # Store in DB
-    # For now, we'll store the local path or a relative URL. 
-    # In a real app, this would be an S3 URL.
-    file_url = f"/static/files/{file_path.name}"
-    
-    cur.execute("""
-        INSERT INTO products (trade_id, owner_id, file_url, title, description)
-        VALUES (%s, %s, %s, %s, %s)
-        RETURNING id, created_at
-    """, (trade_id, uploader_id, file_url, file.filename, f"Trade delivery file: {file.filename}"))
-    
-    file_id, created_at = cur.fetchone()
-    
+
+    uploaded = []
+
+    # Handle file uploads
+    for file in files:
+        if file.filename:
+            file_path = upload_dir / f"trade_{trade_id}_{file.filename}"
+            with file_path.open("wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+            file_url = f"/static/files/{file_path.name}"
+            cur.execute("""
+                INSERT INTO products (trade_id, owner_id, file_url, title, description)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, created_at
+            """, (trade_id, uploader_id, file_url, file.filename, f"Trade delivery file: {file.filename}"))
+            file_id, created_at = cur.fetchone()
+            uploaded.append({
+                "id": file_id,
+                "url": file_url,
+                "name": file.filename,
+                "type": file.content_type,
+                "uploaded_at": created_at.isoformat()
+            })
+
+    # Handle external links
+    for link in links:
+        if link.strip():
+            title = link.split("/")[-1] or "External Link"
+            cur.execute("""
+                INSERT INTO products (trade_id, owner_id, file_url, title, description)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, created_at
+            """, (trade_id, uploader_id, link, title, "External delivery link"))
+            file_id, created_at = cur.fetchone()
+            uploaded.append({
+                "id": file_id,
+                "url": link,
+                "name": title,
+                "type": "link",
+                "uploaded_at": created_at.isoformat()
+            })
+
     conn.commit()
     cur.close()
     conn.close()
 
-    return {
-        "message": "File uploaded successfully",
-        "file": {
-            "id": file_id,
-            "url": file_url,
-            "name": file.filename,
-            "type": file.content_type,
-            "uploaded_at": created_at.isoformat()
-        }
-    }
+    return JSONResponse(content={"message": "Uploaded successfully", "files": uploaded})
 
 @router.get("/trade/files")
 def get_trade_files(trade_id: int):
     conn = get_connection()
     cur = conn.cursor()
-
     cur.execute("""
-        SELECT id, owner_id, file_url, title, created_at 
-        FROM products 
-        WHERE trade_id = %s
-        ORDER BY created_at DESC
+        SELECT p.id, p.trade_id, p.owner_id, u.username, p.title, p.file_url, p.description, p.created_at
+        FROM products p
+        JOIN users u ON p.owner_id = u.id
+        WHERE p.trade_id = %s
+        ORDER BY p.created_at ASC;
     """, (trade_id,))
-    
     rows = cur.fetchall()
     cur.close()
     conn.close()
 
-    files = []
-    for row in rows:
-        files.append({
-            "id": row[0],
-            "uploader_id": row[1],
-            "url": row[2],
-            "type": row[3],
-            "uploaded_at": row[4].isoformat()
-        })
-
+    files = [
+    {
+        "id": row[0],
+        "trade_id": row[1],
+        "owner_id": row[2],
+        "uploader_name": row[3],
+        "title": row[4],
+        "file_url": row[5],
+        "description": row[6],
+        "uploaded_at": row[7].isoformat()
+    }
+    for row in rows
+    ]
+    print(files)
     return {"files": files}
-
 
 @router.patch("/trade/{trade_id}/cancel")
 def cancel_trade(trade_id: int, user_id: int = Form(...)):
@@ -1032,50 +1357,45 @@ def cancel_trade(trade_id: int, user_id: int = Form(...)):
 
     buyer_id, seller_id, escrow_locked = result
 
-    # Check completion
-    cur.execute("SELECT completed FROM trade_completion WHERE trade_id = %s", (trade_id,))
-    comp_res = cur.fetchone()
-    trade_completed = comp_res[0] if comp_res else False
-
-    # Step 2: Validate user and status
+    # Step 2: Check if user is part of the trade
     if user_id not in [buyer_id, seller_id]:
         cur.close()
         conn.close()
         return {"status": "error", "details": "User not part of this trade"}
 
+    # Step 3: Check if escrow is locked
     if escrow_locked:
         cur.close()
         conn.close()
         return {"status": "error", "details": "Cannot cancel after escrow is locked"}
 
-    if trade_completed:
+    # Step 4: Check if trade is already completed
+    cur.execute("SELECT completed FROM trade_completion WHERE trade_id = %s", (trade_id,))
+    comp_res = cur.fetchone()
+    if comp_res and comp_res[0]:
         cur.close()
         conn.close()
         return {"status": "error", "details": "Trade already completed"}
 
-    # Step 3: Mark trade as cancelled
-    # Note: We are not clearing columns that don't exist.
+    # Step 5: Mark trade as cancelled
     cur.execute("""
-        UPDATE trades SET escrow_locked = FALSE,
-                         payment_reference = NULL,
-                         terms_text = NULL
+        UPDATE trades
+        SET is_cancelled = TRUE
         WHERE id = %s
     """, (trade_id,))
-    
-    # Also reset trade_delivery and trade_terms if needed, or just leave them as history.
-    # For now, let's reset delivery status
+
+    # Optional: Reset delivery status
     cur.execute("""
-        UPDATE trade_delivery SET seller_delivered = FALSE, buyer_confirmed = FALSE
+        UPDATE trade_delivery
+        SET seller_delivered = FALSE, buyer_confirmed = FALSE
         WHERE trade_id = %s
     """, (trade_id,))
-
 
     conn.commit()
     cur.close()
     conn.close()
 
     return {"message": "Trade cancelled successfully"}
-
 
 @router.get("/trade/view")
 def view_trade(trade_id: int):

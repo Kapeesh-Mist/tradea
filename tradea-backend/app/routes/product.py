@@ -60,45 +60,6 @@ def upload_product(
         "file_url": file_url
     })
 
-
-@product_router.get("/user/{user_id}/posts")
-def get_user_posts(user_id: int):
-    conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT id, title, description, file_url,tags, created_at
-        FROM products
-        WHERE owner_id = %s
-        ORDER BY created_at DESC
-    """, (user_id,))
-
-    posts = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    return {"posts": posts}
-
-@product_router.post("/product/{product_id}/trade-request")
-def create_trade_request(
-    product_id: int,
-    buyer_id: int = Form(...),
-    message: str = Form(...)
-):
-    conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO trade_requests (product_id, buyer_id, message)
-        VALUES (%s, %s, %s)
-    """, (product_id, buyer_id, message))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    return {"message": "Trade request sent"}
-
 @product_router.get("/product/{product_id}/download")
 def download_product(product_id: int, user_id: int):
     conn = get_connection()

@@ -39,7 +39,6 @@ function MessagesPage() {
     return () => clearInterval(interval);
   }, [selectedChat, fetchChatStatus]);
 
-  // 📥 Load inbox on mount
   useEffect(() => {
     const fetchInbox = async () => {
       try {

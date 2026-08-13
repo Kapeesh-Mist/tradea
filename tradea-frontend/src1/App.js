@@ -2,7 +2,7 @@ import { Routes, Route } from 'react-router-dom';
 import AuthPage from './pages/AuthPage';
 import Dashboard from './pages/Dashboard';
 import Products from './pages/Products';
-import Profile from './pages/Profile';
+import Profile from './pages/profile';
 import Messages from './pages/Messages';
 import Chat from './pages/Chat';
 import Layout from './Layout';
